@@ -1,108 +1,264 @@
-from collections.abc import AsyncGenerator
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
-from uuid import uuid4
+from collections.abc import AsyncGenerator
 
-from sqlalchemy import DateTime, String, Text, func
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+import asyncpg
 
 from src.config.logging import LoggerMixin
 from src.config.settings import Settings
 
 
-class Base(DeclarativeBase):
-    """Base class for all database models."""
-
-    type_annotation_map = {
-        dict[str, Any]: JSONB,
-    }
-
-
-class Document(Base):
-    """Document metadata model."""
-
-    __tablename__ = "documents"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
-    company: Mapped[str] = mapped_column(String(255), index=True)
-    ticker: Mapped[str] = mapped_column(String(20), index=True)
-    document_type: Mapped[str] = mapped_column(String(50), index=True)
-    reference_date: Mapped[datetime] = mapped_column(DateTime, index=True)
-    source_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-    file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True)
-    page_count: Mapped[int | None] = mapped_column(nullable=True)
-    language: Mapped[str] = mapped_column(String(10), default="pt-BR")
-    metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime, server_default=func.now(), onupdate=func.now()
-    )
-
-
-class QueryHistory(Base):
-    """Query history model for analytics."""
-
-    __tablename__ = "query_history"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
-    query_text: Mapped[str] = mapped_column(Text)
-    intent_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    tickers: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
-    response_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
-    tokens_used: Mapped[int] = mapped_column(default=0)
-    processing_time_ms: Mapped[float] = mapped_column(default=0.0)
-    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    metadata: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
-
-
 class DatabaseService(LoggerMixin):
-    """Database service for managing PostgreSQL connections and operations."""
+    """PostgreSQL database service using asyncpg directly."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._engine = create_async_engine(
-            settings.database_url,
-            pool_size=settings.database_pool_size,
-            max_overflow=settings.database_max_overflow,
-            echo=settings.debug,
-        )
-        self._session_factory = async_sessionmaker(
-            self._engine,
-            class_=AsyncSession,
-            expire_on_commit=False,
-        )
+        self._pool: asyncpg.Pool | None = None
+        self._dsn = self._parse_dsn(settings.database_url)
 
-    async def initialize(self) -> None:
-        """Initialize database tables."""
-        async with self._engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        self.logger.info("database_initialized")
+    def _parse_dsn(self, url: str) -> str:
+        """Convert SQLAlchemy-style URL to asyncpg DSN."""
+        return url.replace("postgresql+asyncpg://", "postgresql://")
+
+    async def connect(self) -> None:
+        """Create connection pool."""
+        self._pool = await asyncpg.create_pool(
+            self._dsn,
+            min_size=5,
+            max_size=self._settings.database_pool_size,
+        )
+        await self._create_tables()
+        self.logger.info("database_connected")
 
     async def close(self) -> None:
-        """Close database connections."""
-        await self._engine.dispose()
-        self.logger.info("database_closed")
+        """Close connection pool."""
+        if self._pool:
+            await self._pool.close()
+            self.logger.info("database_closed")
+
+    @property
+    def pool(self) -> asyncpg.Pool:
+        if self._pool is None:
+            raise RuntimeError("Database not connected. Call connect() first.")
+        return self._pool
+
+    async def _create_tables(self) -> None:
+        """Create database tables if they don't exist."""
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS documents (
+                    id VARCHAR(36) PRIMARY KEY,
+                    company VARCHAR(255) NOT NULL,
+                    ticker VARCHAR(20) NOT NULL,
+                    document_type VARCHAR(50) NOT NULL,
+                    reference_date TIMESTAMP NOT NULL,
+                    source_url TEXT,
+                    file_hash VARCHAR(64) UNIQUE,
+                    page_count INTEGER,
+                    language VARCHAR(10) DEFAULT 'pt-BR',
+                    metadata JSONB DEFAULT '{}',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_documents_ticker ON documents(ticker);
+                CREATE INDEX IF NOT EXISTS idx_documents_company ON documents(company);
+                CREATE INDEX IF NOT EXISTS idx_documents_type ON documents(document_type);
+                CREATE INDEX IF NOT EXISTS idx_documents_reference_date ON documents(reference_date);
+            """)
+
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS query_history (
+                    id VARCHAR(36) PRIMARY KEY,
+                    query_text TEXT NOT NULL,
+                    intent_type VARCHAR(50),
+                    tickers JSONB,
+                    response_summary TEXT,
+                    tokens_used INTEGER DEFAULT 0,
+                    processing_time_ms FLOAT DEFAULT 0,
+                    user_id VARCHAR(36),
+                    metadata JSONB DEFAULT '{}',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_query_history_user ON query_history(user_id);
+                CREATE INDEX IF NOT EXISTS idx_query_history_created ON query_history(created_at);
+            """)
+
+        self.logger.info("database_tables_created")
 
     @asynccontextmanager
-    async def session(self) -> AsyncGenerator[AsyncSession, None]:
-        """Get a database session."""
-        async with self._session_factory() as session:
-            try:
-                yield session
-                await session.commit()
-            except Exception:
-                await session.rollback()
-                raise
+    async def connection(self) -> AsyncGenerator[asyncpg.Connection, None]:
+        """Get a database connection from the pool."""
+        async with self.pool.acquire() as conn:
+            yield conn
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncGenerator[asyncpg.Connection, None]:
+        """Get a connection with transaction."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                yield conn
+
+    async def insert_document(
+        self,
+        document_id: str,
+        company: str,
+        ticker: str,
+        document_type: str,
+        reference_date: datetime,
+        source_url: str | None = None,
+        file_hash: str | None = None,
+        page_count: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """Insert a new document record."""
+        async with self.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO documents (
+                    id, company, ticker, document_type, reference_date,
+                    source_url, file_hash, page_count, metadata
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (file_hash) DO NOTHING
+                """,
+                document_id,
+                company,
+                ticker.upper(),
+                document_type,
+                reference_date,
+                source_url,
+                file_hash,
+                page_count,
+                json.dumps(metadata or {}),
+            )
+        return document_id
+
+    async def get_document(self, document_id: str) -> dict[str, Any] | None:
+        """Get a document by ID."""
+        async with self.connection() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM documents WHERE id = $1",
+                document_id,
+            )
+            return dict(row) if row else None
+
+    async def get_documents_by_ticker(
+        self,
+        ticker: str,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Get documents by ticker."""
+        async with self.connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM documents
+                WHERE ticker = $1
+                ORDER BY reference_date DESC
+                LIMIT $2
+                """,
+                ticker.upper(),
+                limit,
+            )
+            return [dict(row) for row in rows]
+
+    async def get_documents_by_company(
+        self,
+        company: str,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Get documents by company name."""
+        async with self.connection() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM documents
+                WHERE company ILIKE $1
+                ORDER BY reference_date DESC
+                LIMIT $2
+                """,
+                f"%{company}%",
+                limit,
+            )
+            return [dict(row) for row in rows]
+
+    async def delete_document(self, document_id: str) -> bool:
+        """Delete a document by ID."""
+        async with self.connection() as conn:
+            result = await conn.execute(
+                "DELETE FROM documents WHERE id = $1",
+                document_id,
+            )
+            return result == "DELETE 1"
+
+    async def insert_query_history(
+        self,
+        query_id: str,
+        query_text: str,
+        intent_type: str | None = None,
+        tickers: list[str] | None = None,
+        response_summary: str | None = None,
+        tokens_used: int = 0,
+        processing_time_ms: float = 0,
+        user_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> str:
+        """Insert a query history record."""
+        async with self.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO query_history (
+                    id, query_text, intent_type, tickers, response_summary,
+                    tokens_used, processing_time_ms, user_id, metadata
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                """,
+                query_id,
+                query_text,
+                intent_type,
+                json.dumps(tickers or []),
+                response_summary,
+                tokens_used,
+                processing_time_ms,
+                user_id,
+                json.dumps(metadata or {}),
+            )
+        return query_id
+
+    async def get_recent_queries(
+        self,
+        user_id: str | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """Get recent queries."""
+        async with self.connection() as conn:
+            if user_id:
+                rows = await conn.fetch(
+                    """
+                    SELECT * FROM query_history
+                    WHERE user_id = $1
+                    ORDER BY created_at DESC
+                    LIMIT $2
+                    """,
+                    user_id,
+                    limit,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT * FROM query_history
+                    ORDER BY created_at DESC
+                    LIMIT $1
+                    """,
+                    limit,
+                )
+            return [dict(row) for row in rows]
 
     async def health_check(self) -> bool:
         """Check database connectivity."""
         try:
-            async with self.session() as session:
-                await session.execute(func.now())
+            async with self.connection() as conn:
+                await conn.fetchval("SELECT 1")
             return True
         except Exception as e:
             self.logger.error("database_health_check_failed", error=str(e))
@@ -118,8 +274,7 @@ async def get_database_service(settings: Settings | None = None) -> DatabaseServ
     if _database_service is None:
         if settings is None:
             from src.config.settings import get_settings
-
             settings = get_settings()
         _database_service = DatabaseService(settings)
-        await _database_service.initialize()
+        await _database_service.connect()
     return _database_service

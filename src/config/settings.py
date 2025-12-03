@@ -22,7 +22,9 @@ class Settings(BaseSettings):
 
     database_url: str = Field(...)
     database_pool_size: int = Field(default=10)
-    database_max_overflow: int = Field(default=20)
+
+    mongodb_url: str = Field(default="mongodb://localhost:27017")
+    mongodb_database: str = Field(default="financial_research")
 
     redis_url: str = Field(default="redis://localhost:6379/0")
     redis_cache_ttl: int = Field(default=3600)

@@ -1,4 +1,3 @@
-from functools import lru_cache
 from typing import Any
 
 from src.config.settings import Settings, get_settings
@@ -20,7 +19,7 @@ async def init_services(settings: Settings) -> None:
 
     try:
         db = DatabaseService(settings)
-        await db.initialize()
+        await db.connect()
         _services["database"] = db
     except Exception as e:
         print(f"Warning: Database initialization failed: {e}")
